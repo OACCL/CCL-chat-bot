@@ -1,4 +1,5 @@
 import os
+import json
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -10,16 +11,65 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PORT = os.getenv("PORT")
 
-# 봇 인텐트(Intents) 설정 - 슬래시 명령어는 기본 인텐트만으로 작동 가능
+# 봇 인텐트(Intents) 설정
 intents = discord.Intents.default()
 intents.guilds = True
 
 # 슬래시 전용 봇 설정
 bot = commands.Bot(command_prefix="/", intents=intents)
 
+# ----------------- 권한 관리 (내가 지정한 사람만 사용) -----------------
+ALLOWED_USERS_FILE = "allowed_users.json"
 
+def load_allowed_users() -> set[int]:
+    """저장된 허용 유저 ID 목록을 불러옵니다."""
+    users = set()
+    # 1) 환경 변수 ALLOWED_USERS (콤마로 구분된 ID 목록)
+    env_users = os.getenv("ALLOWED_USERS", "")
+    for uid in env_users.split(","):
+        uid = uid.strip()
+        if uid.isdigit():
+            users.add(int(uid))
+
+    # 2) JSON 파일에서 불러오기
+    if os.path.exists(ALLOWED_USERS_FILE):
+        try:
+            with open(ALLOWED_USERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                users.update(data)
+        except Exception as e:
+            print(f"allowed_users.json 읽기 오류: {e}", flush=True)
+    return users
+
+def save_allowed_users(users: set[int]):
+    """허용 유저 ID 목록을 JSON 파일에 저장합니다."""
+    try:
+        with open(ALLOWED_USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(users), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"allowed_users.json 저장 오류: {e}", flush=True)
+
+allowed_user_ids = load_allowed_users()
+
+# 봇 소유자(제작자) 확인 함수
+async def is_owner(user: discord.User | discord.Member) -> bool:
+    try:
+        app_info = await bot.application_info()
+        if app_info.team:
+            return any(m.id == user.id for m in app_info.team.members)
+        return user.id == app_info.owner.id
+    except Exception:
+        return False
+
+# 봇 사용 허용 대상인지 확인 함수 (소유자 + 지정된 유저)
+async def is_authorized(user: discord.User | discord.Member) -> bool:
+    if await is_owner(user):
+        return True
+    return user.id in allowed_user_ids
+
+# ----------------- 클라우드 헬스체크 웹서버 -----------------
 async def start_health_check_server():
-    """클라우드 호스팅(Koyeb, Render 등) 포트 바인딩 요구를 만족하기 위한 경량 헬스체크 웹서버"""
+    """클라우드 호스팅(Render 등) 포트 바인딩 요구를 만족하기 위한 경량 헬스체크 웹서버"""
     if PORT:
         try:
             app = web.Application()
@@ -32,24 +82,21 @@ async def start_health_check_server():
         except Exception as e:
             print(f"헬스체크 서버 시작 실패: {e}", flush=True)
 
-
+# ----------------- 웹후크 헬퍼 -----------------
 async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
     """해당 채널에서 봇이 사용할 수 있는 웹후크를 찾거나 새로 만듭니다."""
     try:
         webhooks = await channel.webhooks()
-        # 기존에 생성된 웹후크 재사용
         for wh in webhooks:
             if wh.user == bot.user or wh.name == "ProxyChatWebhook":
                 return wh
         
-        # 없으면 새로 생성 (채널당 최대 15개 제한 확인)
         if len(webhooks) < 15:
             return await channel.create_webhook(name="ProxyChatWebhook")
         else:
             return webhooks[0]
     except discord.Forbidden:
-        raise PermissionError("봇에게 '웹후크 관리(Manage Webhooks)' 권한이 없습니다. 디스코드 서버 설정에서 봇 권한을 확인해주세요.")
-
+        raise PermissionError("봇에게 '웹후크 관리(Manage Webhooks)' 권한이 없습니다. 서버 설정에서 권한을 확인해주세요.")
 
 # 공통 웹후크 전송 처리 로직
 async def handle_chat(
@@ -57,6 +104,14 @@ async def handle_chat(
     content: str, 
     photo: discord.Attachment = None
 ):
+    # 권한 검사 (소유자 및 지정된 유저만 허용)
+    if not await is_authorized(interaction.user):
+        await interaction.response.send_message(
+            "⛔ 이 봇의 사용 권한이 없습니다. 봇 관리자에게 문의하세요.", 
+            ephemeral=True
+        )
+        return
+
     channel = interaction.channel
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message("이 명령어는 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
@@ -66,22 +121,18 @@ async def handle_chat(
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # 스레드 여부 확인
         target_channel = channel.parent if isinstance(channel, discord.Thread) else channel
         webhook = await get_or_create_webhook(target_channel)
 
-        # 명령어를 친 유저의 서버 닉네임과 아바타 URL 가져오기
         user = interaction.user
         display_name = user.display_name
         avatar_url = user.display_avatar.url
 
-        # 파일 첨부 처리
         files = []
         if photo:
             file = await photo.to_file()
             files.append(file)
 
-        # 웹후크로 해당 유저인 것처럼 메시지 전송
         if isinstance(channel, discord.Thread):
             await webhook.send(
                 content=content,
@@ -98,7 +149,7 @@ async def handle_chat(
                 files=files
             )
 
-        # 실행자 화면의 임시 알림 삭제 (깔끔하게 흔적 제거)
+        # 전송 후 임시 응답 삭제하여 자연스러운 채팅 유지
         try:
             await interaction.delete_original_response()
         except Exception:
@@ -110,17 +161,17 @@ async def handle_chat(
         await interaction.followup.send(f"❌ 전송 실패: {str(e)}", ephemeral=True)
 
 
+# ----------------- 봇 시작 이벤트 -----------------
 @bot.event
 async def on_ready():
-    """봇이 실행되었을 때 중복 명령어를 정리하고 글로벌 슬래시 명령어를 등록합니다."""
+    """봇이 켜졌을 때 중복 명령어를 정리하고 글로벌 명령어를 등록합니다."""
     print("=====================================", flush=True)
     print(f"봇 로그인 성공: {bot.user.name} (ID: {bot.user.id})", flush=True)
     print(f"현재 접속된 서버 수: {len(bot.guilds)}개", flush=True)
     
-    # 헬스체크 웹서버 구동 (PORT 설정 시)
     await start_health_check_server()
 
-    # 1) 서버별 중복 명령어(길드 전용)를 깨끗하게 청소 (중복 2개 뜨는 버그 해결)
+    # 1) 서버별 중복 명령어 청소
     for guild in bot.guilds:
         try:
             bot.tree.clear_commands(guild=guild)
@@ -132,12 +183,11 @@ async def on_ready():
     # 2) 단일 글로벌 슬래시 명령어 등록
     try:
         synced = await bot.tree.sync()
-        print(f"글로벌 슬래시(/) 명령어 {len(synced)}개 등록 완료! (/채팅, /chat, /핑)", flush=True)
+        print(f"글로벌 슬래시(/) 명령어 {len(synced)}개 등록 완료!", flush=True)
     except Exception as e:
         print(f"글로벌 동기화 오류: {e}", flush=True)
     print("=====================================", flush=True)
     
-    # 활동 상태 표시
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.playing, 
@@ -146,11 +196,10 @@ async def on_ready():
     )
 
 
-# 1. 한글 슬래시 명령어: /채팅 [내용] [사진(선택)]
-@bot.tree.command(
-    name="채팅", 
-    description="내 프로필과 닉네임으로 웹후크 메시지를 전송합니다."
-)
+# ----------------- 슬래시 명령어 목록 -----------------
+
+# 1. /채팅
+@bot.tree.command(name="채팅", description="내 프로필과 닉네임으로 웹후크 메시지를 전송합니다.")
 @app_commands.describe(
     내용="전송할 채팅 내용을 입력하세요.",
     사진="함께 전송할 사진 파일(선택사항)"
@@ -163,11 +212,8 @@ async def chat_slash_ko(
     await handle_chat(interaction, 내용, 사진)
 
 
-# 2. 영문 슬래시 명령어: /chat [message] [사진(선택)]
-@bot.tree.command(
-    name="chat", 
-    description="내 프로필과 닉네임으로 웹후크 메시지를 전송합니다."
-)
+# 2. /chat
+@bot.tree.command(name="chat", description="내 프로필과 닉네임으로 웹후크 메시지를 전송합니다.")
 @app_commands.describe(
     message="전송할 채팅 내용을 입력하세요.",
     사진="함께 전송할 사진 파일(선택사항)"
@@ -180,7 +226,65 @@ async def chat_slash_en(
     await handle_chat(interaction, message, 사진)
 
 
-# 3. 지연시간 확인: /핑
+# 3. /권한추가 (소유자 전용)
+@bot.tree.command(name="권한추가", description="[소유자 전용] 봇을 사용할 수 있는 유저를 추가합니다.")
+@app_commands.describe(유저="봇 사용을 허용할 유저를 선택하세요.")
+async def add_permission(interaction: discord.Interaction, 유저: discord.User):
+    if not await is_owner(interaction.user):
+        await interaction.response.send_message("⛔ 봇 소유자만 이 명령어를 실행할 수 있습니다.", ephemeral=True)
+        return
+    
+    allowed_user_ids.add(유저.id)
+    save_allowed_users(allowed_user_ids)
+    await interaction.response.send_message(
+        f"✅ **{유저.display_name}** (`{유저.name}`) 님이 봇 사용 허용 목록에 추가되었습니다!", 
+        ephemeral=True
+    )
+
+
+# 4. /권한제거 (소유자 전용)
+@bot.tree.command(name="권한제거", description="[소유자 전용] 봇 사용 권한 목록에서 유저를 제거합니다.")
+@app_commands.describe(유저="권한을 회수할 유저를 선택하세요.")
+async def remove_permission(interaction: discord.Interaction, 유저: discord.User):
+    if not await is_owner(interaction.user):
+        await interaction.response.send_message("⛔ 봇 소유자만 이 명령어를 실행할 수 있습니다.", ephemeral=True)
+        return
+    
+    if 유저.id in allowed_user_ids:
+        allowed_user_ids.remove(유저.id)
+        save_allowed_users(allowed_user_ids)
+        await interaction.response.send_message(
+            f"❌ **{유저.display_name}** 님이 허용 목록에서 제거되었습니다.", 
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"ℹ️ **{유저.display_name}** 님은 허용 목록에 등록되어 있지 않습니다.", 
+            ephemeral=True
+        )
+
+
+# 5. /권한목록 (소유자 전용)
+@bot.tree.command(name="권한목록", description="[소유자 전용] 현재 봇을 사용할 수 있는 유저 목록을 조회합니다.")
+async def list_permission(interaction: discord.Interaction):
+    if not await is_owner(interaction.user):
+        await interaction.response.send_message("⛔ 봇 소유자만 이 명령어를 실행할 수 있습니다.", ephemeral=True)
+        return
+    
+    app_info = await bot.application_info()
+    owner_name = app_info.owner.name
+    
+    msg = f"👑 **봇 소유자**: {owner_name}\n"
+    if allowed_user_ids:
+        users_str = "\n".join([f"- <@{uid}> (`{uid}`)" for uid in allowed_user_ids])
+        msg += f"\n👥 **사용 허용된 유저 ({len(allowed_user_ids)}명)**:\n{users_str}"
+    else:
+        msg += "\n👥 **추가 허용된 유저 없음** (현재 소유자 본인만 사용 가능)"
+    
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+# 6. /핑
 @bot.tree.command(name="핑", description="봇의 응답 지연 시간(Ping)을 측정합니다.")
 async def ping(interaction: discord.Interaction):
     latency_ms = round(bot.latency * 1000)
@@ -190,7 +294,6 @@ async def ping(interaction: discord.Interaction):
 if __name__ == "__main__":
     if not TOKEN:
         print("\n[오류] .env 파일에 DISCORD_TOKEN이 설정되지 않았습니다.", flush=True)
-        print(".env 파일을 열고 발급받은 디스코드 봇 토큰을 입력해주세요.", flush=True)
         exit(1)
         
     print("디스코드 봇을 실행하는 중입니다...", flush=True)
